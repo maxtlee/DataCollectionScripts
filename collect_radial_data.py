@@ -208,10 +208,14 @@ def build_grid(hw: float, hh: float, step: float) -> list[tuple[float, float]]:
 @dataclass
 class MotionPlan:
     pt_idx:      int
-    deg_idx:     int
+    dir_idx:     int
     px:          float   # starting point in sensor frame (mm)
     pz:          float
-    speed_deg_s: float
+    theta_deg:   float   # direction of outward stroke
+    speed_mm_s:  float
+    edge_x:      float   # endpoint on rectangle boundary
+    edge_z:      float
+    distance_mm: float   # one-way distance
     folder:      str     # e.g.  "pt0042_dir003"
 
 
@@ -242,49 +246,6 @@ def plan_all(hw: float, hh: float, grid_mm: float,
                 folder=folder,
             ))
     return plans
-
-
-# @dataclass
-# class MotionPlan:
-#     pt_idx:      int
-#     dir_idx:     int
-#     px:          float   # starting point in sensor frame (mm)
-#     pz:          float
-#     theta_deg:   float   # direction of outward stroke
-#     speed_mm_s:  float
-#     edge_x:      float   # endpoint on rectangle boundary
-#     edge_z:      float
-#     distance_mm: float   # one-way distance
-#     folder:      str     # e.g.  "pt0042_dir003"
-
-
-# def plan_all(hw: float, hh: float, grid_mm: float,
-#              vmin: float, vmax: float,
-#              seed: int = 42) -> list[MotionPlan]:
-#     rng = random.Random(seed)
-#     grid = build_grid(hw, hh, grid_mm)
-#     plans = []
-#     for pt_idx, (px, pz) in enumerate(grid):
-#         lo, arc = compute_valid_arc(px, pz, hw, hh)
-#         n_dirs  = max(1, round(arc / DEG_PER_DIRECTION))
-#         dirs    = sample_directions(lo, arc, n_dirs, rng)
-#         for dir_idx, theta in enumerate(dirs):
-#             ex, ez   = ray_to_edge(px, pz, theta, hw, hh)
-#             dist     = math.hypot(ex - px, ez - pz)
-#             if dist < 0.1:          # ray hit boundary without moving – skip
-#                 continue
-#             speed    = rng.uniform(vmin, vmax)
-#             folder   = f"pt{pt_idx:04d}_dir{dir_idx:03d}"
-#             plans.append(MotionPlan(
-#                 pt_idx=pt_idx, dir_idx=dir_idx,
-#                 px=px, pz=pz,
-#                 theta_deg=theta,
-#                 speed_mm_s=speed,
-#                 edge_x=ex, edge_z=ez,
-#                 distance_mm=dist,
-#                 folder=folder,
-#             ))
-#     return plans
 
 
 # ─────────────────────────────────────────────────────────────────────────────
