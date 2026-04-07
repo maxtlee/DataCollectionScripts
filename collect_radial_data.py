@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-collect_radial_data.py  –  Radial-sweep data collection for XArm fingerpad
+collect_radial_data.py  –  Pitch-rotation data collection for XArm fingerpad
 
-Samples a uniform grid of starting points across the sensor rectangle (2 mm apart
-by default).  From each starting point the arm moves outward in several randomly-
-chosen directions, all the way to the rectangle edge, then returns to the starting
-point.  The number of directions sampled per point is proportional to the available
-angular range at that point:
+Generates random rotation paths in the pitch direction.  For each path:
+  - A rotation centre is chosen within a ~1"x2" box around the gripper
+    endpoint by setting the xArm TCP offset
+  - Random start and end pitch angles are chosen within [--pitch-min … --pitch-max]
+  - A random speed is chosen for the motion
 
-  Interior point   →  360 °  →  ~36 directions
-  Edge point       →  180 °  →  ~18 directions
-  Corner point     →   90 °  →   ~9 directions
+The arm rotates from start_pitch to end_pitch, dwells briefly, then returns.
 
-A random speed in [--vmin … --vmax] mm/s is chosen independently for every move.
+For rotation-only moves the xArm interprets the speed parameter as rotational
+speed (0-1000 ≈ 0-180 deg/s).
 
 Folder layout
 ─────────────
   {output}/
-    pt{IIII}_dir{JJJ}/          e.g.  pt0042_dir003/
+    path{NNNN}/
         robot_pose_planned.csv
         robot_pose_recorded.csv
-        motion_parameters.csv   (point_x_mm, point_z_mm, direction_deg, speed_mm_s,
-                                  edge_x_mm, edge_z_mm, distance_mm)
+        motion_parameters.csv   (offset_x_mm, offset_z_mm, start_pitch_deg,
+                                  end_pitch_deg, speed)
         audio.wav               (only with --audio)
         audio_sync.json
         audio_timestamps.csv
@@ -34,14 +33,13 @@ Usage
   # Live robot:
   python collect_radial_data.py -o ./data --ip 192.168.1.200 --audio
 
-  # Custom grid spacing and speed range:
-  python collect_radial_data.py -o ./data --grid-mm 3 --vmin 5 --vmax 60
+  # Custom parameters:
+  python collect_radial_data.py -o ./data --num-paths 200 --vmin 20 --vmax 120
 """
 
 import argparse
 import csv
 import json
-import math
 import os
 import queue as _audio_queue
 import random
@@ -50,13 +48,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
-
-try:
-    import numpy as np
-except ImportError:
-    sys.exit("NumPy required:  pip install numpy")
 
 try:
     from xarm.wrapper import XArmAPI
@@ -80,125 +72,17 @@ XARM_MAX_ACC_MM_S2 = 5000.0
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults
 # ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_GRID_MM     = 2.0
-DEFAULT_VMIN_MM_S   = 10.0
-DEFAULT_VMAX_MM_S   = 50.0
-DEFAULT_MVACC_MM_S2 = 200.0
-DEFAULT_DWELL_S     = 0.3
-DEFAULT_MARGIN      = 0.05
-EDGE_TOL_MM         = 1e-3   # distance to wall to be considered "on edge"
-DEG_PER_DIRECTION   = 10.0   # one direction sampled per this many degrees of range
+DEFAULT_NUM_PATHS    = 500
+DEFAULT_VMIN         = 10.0
+DEFAULT_VMAX         = 50.0
+DEFAULT_MVACC_MM_S2  = 200.0
+DEFAULT_DWELL_S      = 0.3
+DEFAULT_PITCH_MIN    = -100.0
+DEFAULT_PITCH_MAX    = 100.0
+OFFSET_BOX_X_MM      = 25.4    # 1 inch
+OFFSET_BOX_Z_MM      = 50.8    # 2 inches
 
 SEP = "─" * 64
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Geometry helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_valid_arc(px: float, pz: float, hw: float, hh: float) -> tuple[float, float]:
-    """
-    Return the contiguous valid angular arc as (theta_lo_deg, arc_deg).
-
-    Convention: theta=0 → +X, theta=90 → +Z (CCW).
-    "Valid" means the direction leads immediately into the rectangle interior.
-
-    Strategy: each active wall contributes an inward-facing normal.  The valid
-    arc is a half-plane (180°) per wall, intersected for corners (→ 90°).
-    We compute the arc centre as the vector mean of the inward normals.
-
-      Interior  →  360°  (lo=0)
-      Edge      →  180°  (lo = normal_dir − 90°)
-      Corner    →   90°  (lo = mean_normal − 45°)
-    """
-    on_left   = abs(px + hw) < EDGE_TOL_MM
-    on_right  = abs(px - hw) < EDGE_TOL_MM
-    on_bottom = abs(pz + hh) < EDGE_TOL_MM
-    on_top    = abs(pz - hh) < EDGE_TOL_MM
-
-    # Inward-facing normals of each active wall (degrees)
-    #   left wall  → inward = +X = 0°
-    #   right wall → inward = -X = 180°
-    #   bottom     → inward = +Z = 90°
-    #   top        → inward = -Z = 270°
-    normals = []
-    if on_left:   normals.append(0.0)
-    if on_right:  normals.append(180.0)
-    if on_bottom: normals.append(90.0)
-    if on_top:    normals.append(270.0)
-
-    if not normals:
-        return 0.0, 360.0   # interior point: all directions valid
-
-    # arc width = 360° / 2^(number of active walls)
-    arc_deg = 360.0 / (2 ** len(normals))   # 180° for 1 wall, 90° for 2 walls
-
-    if len(normals) == 1:
-        center = normals[0]
-    else:
-        # Vector mean of inward normals → gives the bisecting direction
-        rads = [math.radians(n) for n in normals]
-        cx = sum(math.cos(r) for r in rads)
-        cz = sum(math.sin(r) for r in rads)
-        center = math.degrees(math.atan2(cz, cx)) % 360.0
-
-    lo = (center - arc_deg / 2.0) % 360.0
-    return lo, arc_deg
-
-
-def ray_to_edge(px: float, pz: float, theta_deg: float,
-                hw: float, hh: float) -> tuple[float, float]:
-    """
-    From point (px, pz) shoot a ray in direction theta_deg (degrees, CCW from +X).
-    Return the point where it first hits the rectangle boundary.
-    """
-    theta = math.radians(theta_deg)
-    dx, dz = math.cos(theta), math.sin(theta)
-    t_candidates = []
-    if abs(dx) > 1e-12:
-        for wall_x in (-hw, hw):
-            t = (wall_x - px) / dx
-            if t > 1e-9:
-                z_hit = pz + t * dz
-                if -hh - 1e-9 <= z_hit <= hh + 1e-9:
-                    t_candidates.append(t)
-    if abs(dz) > 1e-12:
-        for wall_z in (-hh, hh):
-            t = (wall_z - pz) / dz
-            if t > 1e-9:
-                x_hit = px + t * dx
-                if -hw - 1e-9 <= x_hit <= hw + 1e-9:
-                    t_candidates.append(t)
-    if not t_candidates:
-        return px, pz  # degenerate – shouldn't happen for interior points
-    t_min = min(t_candidates)
-    ex = np.clip(px + t_min * dx, -hw, hw)
-    ez = np.clip(pz + t_min * dz, -hh, hh)
-    return float(ex), float(ez)
-
-
-def sample_directions(lo_deg: float, arc_deg: float, n: int, rng: random.Random) -> list[float]:
-    """
-    Stratified-random sample of n angles within the arc [lo_deg, lo_deg+arc_deg).
-    Divides the arc into n equal bins and picks one uniform random angle per bin.
-    """
-    if n <= 0:
-        return []
-    bin_size = arc_deg / n
-    return [(lo_deg + (k + rng.random()) * bin_size) % 360.0 for k in range(n)]
-
-
-def build_grid(hw: float, hh: float, step: float) -> list[tuple[float, float]]:
-    """Return all grid points in [-hw,hw]×[-hh,hh] spaced step mm apart."""
-    xs = np.arange(-hw, hw + step * 0.5, step)
-    zs = np.arange(-hh, hh + step * 0.5, step)
-    points = []
-    for z in zs:
-        for x in xs:
-            x_c = float(np.clip(x, -hw, hw))
-            z_c = float(np.clip(z, -hh, hh))
-            points.append((x_c, z_c))
-    return points
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,44 +91,42 @@ def build_grid(hw: float, hh: float, step: float) -> list[tuple[float, float]]:
 
 @dataclass
 class MotionPlan:
-    pt_idx:      int
-    dir_idx:     int
-    px:          float   # starting point in sensor frame (mm)
-    pz:          float
-    theta_deg:   float   # direction of outward stroke
-    speed_mm_s:  float
-    edge_x:      float   # endpoint on rectangle boundary
-    edge_z:      float
-    distance_mm: float   # one-way distance
-    folder:      str     # e.g.  "pt0042_dir003"
+    path_idx:        int
+    offset_x_mm:     float   # TCP offset X (rotation centre, tool frame)
+    offset_z_mm:     float   # TCP offset Z (rotation centre, tool frame)
+    start_pitch_deg: float   # starting pitch angle
+    end_pitch_deg:   float   # ending pitch angle
+    speed:           float   # motion speed (xArm speed parameter)
+    folder:          str
 
 
-def plan_all(hw: float, hh: float, grid_mm: float,
-             vmin: float, vmax: float,
+def plan_all(num_paths: int, vmin: float, vmax: float,
+             pitch_min: float, pitch_max: float,
              seed: int = 42) -> list[MotionPlan]:
     rng = random.Random(seed)
-    grid = build_grid(hw, hh, grid_mm)
-    plans = []
-    for pt_idx, (px, pz) in enumerate(grid):
-        lo, arc = compute_valid_arc(px, pz, hw, hh)
-        n_dirs  = max(1, round(arc / DEG_PER_DIRECTION))
-        dirs    = sample_directions(lo, arc, n_dirs, rng)
-        for dir_idx, theta in enumerate(dirs):
-            ex, ez   = ray_to_edge(px, pz, theta, hw, hh)
-            dist     = math.hypot(ex - px, ez - pz)
-            if dist < 0.1:          # ray hit boundary without moving – skip
-                continue
-            speed    = rng.uniform(vmin, vmax)
-            folder   = f"pt{pt_idx:04d}_dir{dir_idx:03d}"
-            plans.append(MotionPlan(
-                pt_idx=pt_idx, dir_idx=dir_idx,
-                px=px, pz=pz,
-                theta_deg=theta,
-                speed_mm_s=speed,
-                edge_x=ex, edge_z=ez,
-                distance_mm=dist,
-                folder=folder,
-            ))
+    plans: list[MotionPlan] = []
+    half_x = OFFSET_BOX_X_MM / 2.0   # ±12.7 mm
+    half_z = OFFSET_BOX_Z_MM / 2.0   # ±25.4 mm
+
+    for i in range(num_paths):
+        offset_x = rng.uniform(-half_x, half_x)
+        offset_z = rng.uniform(-half_z, half_z)
+        start_pitch = rng.uniform(pitch_min, pitch_max)
+        end_pitch   = rng.uniform(pitch_min, pitch_max)
+        # Ensure start and end differ by at least 5°
+        while abs(end_pitch - start_pitch) < 5.0:
+            end_pitch = rng.uniform(pitch_min, pitch_max)
+        speed  = rng.uniform(vmin, vmax)
+        folder = f"path{i:04d}"
+        plans.append(MotionPlan(
+            path_idx=i,
+            offset_x_mm=offset_x,
+            offset_z_mm=offset_z,
+            start_pitch_deg=start_pitch,
+            end_pitch_deg=end_pitch,
+            speed=speed,
+            folder=folder,
+        ))
     return plans
 
 
@@ -349,8 +231,7 @@ class AudioRecorder:
 # ─────────────────────────────────────────────────────────────────────────────
 
 RECORD_COLS = ["timestamp_s", "x_mm", "y_mm", "z_mm", "roll_deg", "pitch_deg", "yaw_deg"]
-MOTION_COLS = ["point_x_mm", "point_z_mm", "direction_deg", "speed_mm_s",
-               "edge_x_mm", "edge_z_mm", "distance_mm"]
+MOTION_COLS = ["offset_x_mm", "offset_z_mm", "start_pitch_deg", "end_pitch_deg", "speed"]
 
 
 class DataLogger:
@@ -375,8 +256,9 @@ class DataLogger:
         self._fp.flush(); self._n_planned += 1
 
     def log_motion_params(self, plan: MotionPlan):
-        self._wm.writerow([plan.px, plan.pz, plan.theta_deg, plan.speed_mm_s,
-                           plan.edge_x, plan.edge_z, plan.distance_mm])
+        self._wm.writerow([plan.offset_x_mm, plan.offset_z_mm,
+                           plan.start_pitch_deg, plan.end_pitch_deg,
+                           plan.speed])
         self._fm.flush()
 
     def start_polling(self, arm):
@@ -423,10 +305,6 @@ class RobotState:
         return time.time() - self.t_start
 
 
-def build_tcp(dx_mm, dz_mm, ox_mm, oy_mm, oz_mm, roll, pitch, yaw):
-    return [ox_mm + dx_mm, oy_mm, oz_mm + dz_mm, roll, pitch, yaw]
-
-
 def do_move(arm, tcp, speed, mvacc, state: RobotState, dry_run,
             logger: Optional[DataLogger] = None):
     if logger:
@@ -441,34 +319,60 @@ def do_move(arm, tcp, speed, mvacc, state: RobotState, dry_run,
     return True
 
 
-def run_radial_motion(arm, state: RobotState, plan: MotionPlan,
-                      ox_mm, oy_mm, oz_mm, roll, pitch, yaw,
-                      mvacc, dwell_s, dry_run,
-                      logger: Optional[DataLogger] = None) -> bool:
+def run_rotation_motion(arm, state: RobotState, plan: MotionPlan,
+                        ox_mm, oy_mm, oz_mm, roll, yaw,
+                        base_tcp_offset, mvacc, dwell_s, dry_run,
+                        logger: Optional[DataLogger] = None) -> bool:
     """
-    Execute one radial stroke:
-      1. (Already at starting point – caller ensures this)
-      2. Move outward to edge
-      3. Dwell briefly
-      4. Return to starting point
+    Execute one rotation path:
+      1. Set TCP offset to define the rotation centre
+      2. Move to start pitch
+      3. Rotate to end pitch
+      4. Dwell briefly
+      5. Return to start pitch
+      6. Restore original TCP offset
     """
     if logger:
         logger.log_motion_params(plan)
 
-    speed = plan.speed_mm_s
+    speed = plan.speed
 
-    # Outward move
-    tcp_edge = build_tcp(plan.edge_x, plan.edge_z, ox_mm, oy_mm, oz_mm, roll, pitch, yaw)
-    ok = do_move(arm, tcp_edge, speed, mvacc, state, dry_run, logger)
+    # Set TCP offset: base (saved) offset + path-specific rotation centre
+    if arm is not None:
+        path_offset = [base_tcp_offset[0] + plan.offset_x_mm,
+                       base_tcp_offset[1],
+                       base_tcp_offset[2] + plan.offset_z_mm,
+                       base_tcp_offset[3],
+                       base_tcp_offset[4],
+                       base_tcp_offset[5]]
+        arm.set_tcp_offset(path_offset)
+        time.sleep(0.5)
+
+    # TCP positions: same XYZ, only pitch changes
+    tcp_start = [ox_mm, oy_mm, oz_mm, roll, plan.start_pitch_deg, yaw]
+    tcp_end   = [ox_mm, oy_mm, oz_mm, roll, plan.end_pitch_deg,   yaw]
+
+    # Move to start pitch
+    ok = do_move(arm, tcp_start, speed, mvacc, state, dry_run, logger)
     if not ok: return False
 
-    # Brief dwell at edge
+    # Rotate to end pitch
+    ok = do_move(arm, tcp_end, speed, mvacc, state, dry_run, logger)
+    if not ok: return False
+
+    # Dwell at end position
     time.sleep(dwell_s)
 
-    # Return to starting point
-    tcp_start = build_tcp(plan.px, plan.pz, ox_mm, oy_mm, oz_mm, roll, pitch, yaw)
+    # Return to start pitch
     ok = do_move(arm, tcp_start, speed, mvacc, state, dry_run, logger)
-    return ok
+    if not ok: return False
+
+    # Restore original TCP offset
+    if arm is not None:
+        arm.set_tcp_offset(base_tcp_offset)
+        time.sleep(0.2)
+
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,54 +381,49 @@ def run_radial_motion(arm, state: RobotState, plan: MotionPlan,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Radial sweep data collection for XArm fingerpad",
+        description="Pitch-rotation data collection for XArm fingerpad",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # ── geometry ───────────────────────────────────────────────────────────
-    parser.add_argument("--height-cm",   type=float, default=3.1,
-                        help="Sensor rectangle height (Y-axis on sensor) [cm]")
-    parser.add_argument("--width-cm",    type=float, default=2.5,
-                        help="Sensor rectangle width [cm]")
     parser.add_argument("--origin-x-mm", type=float, default=280.5,
-                        help="TCP X of sensor centre [mm]")
+                        help="TCP X of rotation reference point [mm]")
     parser.add_argument("--origin-z-mm", type=float, default=83.0,
-                        help="TCP Z of sensor centre [mm]")
+                        help="TCP Z of rotation reference point [mm]")
 
     # ── TCP fixed values ───────────────────────────────────────────────────
     parser.add_argument("--y",     type=float, default=250.5)
     parser.add_argument("--roll",  type=float, default=178)
-    parser.add_argument("--pitch", type=float, default=-2)
     parser.add_argument("--yaw",   type=float, default=2)
-    #TODO: Hand tune --origin-x-mm, --origin-z-mm, --y, --roll, --pitch, --yaw to get the best alignment with the calibrated object.
+    #TODO: Hand tune --origin-x-mm, --origin-z-mm, --y, --roll, --yaw to get the best alignment with the calibrated object.
 
-    # ── grid & motion params ───────────────────────────────────────────────
-    parser.add_argument("--grid-mm", type=float, default=DEFAULT_GRID_MM,
-                        help="Grid spacing between starting points [mm]")
-    parser.add_argument("--vmin", type=float, default=DEFAULT_VMIN_MM_S,
-                        help="Minimum random stroke speed [mm/s]")
-    parser.add_argument("--vmax", type=float, default=DEFAULT_VMAX_MM_S,
-                        help="Maximum random stroke speed [mm/s]")
-    parser.add_argument("--margin", type=float, default=DEFAULT_MARGIN,
-                        help="Safety margin (fraction of half-width/height) "
-                             "shrunk from all four sides")
+    # ── rotation params ───────────────────────────────────────────────────
+    parser.add_argument("--num-paths", type=int, default=DEFAULT_NUM_PATHS,
+                        help="Number of rotation paths to generate")
+    parser.add_argument("--pitch-min", type=float, default=DEFAULT_PITCH_MIN,
+                        help="Minimum pitch angle [deg]")
+    parser.add_argument("--pitch-max", type=float, default=DEFAULT_PITCH_MAX,
+                        help="Maximum pitch angle [deg]")
+    parser.add_argument("--vmin", type=float, default=DEFAULT_VMIN,
+                        help="Minimum random speed (xArm speed parameter)")
+    parser.add_argument("--vmax", type=float, default=DEFAULT_VMAX,
+                        help="Maximum random speed (xArm speed parameter)")
     parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducible direction/speed sampling")
+                        help="Random seed for reproducible sampling")
 
     # ── robot connection ───────────────────────────────────────────────────
     parser.add_argument("--ip",      type=str, default="192.168.1.200")
     parser.add_argument("--dry-run", action="store_true")
 
-
     # ── motion tuning ──────────────────────────────────────────────────────
     parser.add_argument("--mvacc", type=float, default=DEFAULT_MVACC_MM_S2,
-                        help="Linear acceleration [mm/s²]")
+                        help="Acceleration [mm/s²]")
     parser.add_argument("--dwell", type=float, default=DEFAULT_DWELL_S,
-                        help="Dwell time at edge before returning [s]")
+                        help="Dwell time at end pitch before returning [s]")
 
     # ── output ─────────────────────────────────────────────────────────────
     parser.add_argument("-o", "--output", type=str, required=True,
-                        help="Base output folder; pt####_dir### subfolders created inside")
+                        help="Base output folder; path#### subfolders created inside")
     parser.add_argument("--skip-existing", action=argparse.BooleanOptionalAction,
                         default=True)
 
@@ -538,6 +437,8 @@ def main():
 
     if args.vmin >= args.vmax:
         parser.error("--vmin must be less than --vmax")
+    if args.pitch_min >= args.pitch_max:
+        parser.error("--pitch-min must be less than --pitch-max")
     if args.mvacc > XARM_MAX_ACC_MM_S2:
         parser.error(f"--mvacc exceeds {XARM_MAX_ACC_MM_S2}")
     if not args.dry_run and not XARM_AVAILABLE:
@@ -545,42 +446,43 @@ def main():
     if args.audio and not AUDIO_AVAILABLE:
         parser.error("sounddevice/soundfile not found.  Omit --audio.")
 
-    hw_mm = (args.width_cm  / 2.0) * 10.0 * (1.0 - args.margin)
-    hh_mm = (args.height_cm / 2.0) * 10.0 * (1.0 - args.margin)
-
     # ── plan all motions ───────────────────────────────────────────────────
-    print("  Planning trajectories ...", end="", flush=True)
-    plans = plan_all(hw_mm, hh_mm, args.grid_mm, args.vmin, args.vmax, args.seed)
-    n_pts  = len(set((p.pt_idx for p in plans)))
-    total  = len(plans)
-    print(f" ✓  ({n_pts} grid points, {total} radial motions)")
+    print("  Planning rotation paths ...", end="", flush=True)
+    plans = plan_all(args.num_paths, args.vmin, args.vmax,
+                     args.pitch_min, args.pitch_max, args.seed)
+    total = len(plans)
+    print(f" ✓  ({total} rotation paths)")
 
     # ── print session header ───────────────────────────────────────────────
     print(f"\n{SEP}")
-    print(f"  COLLECT RADIAL DATA")
-    print(f"  Rectangle : {2*hw_mm:.1f} × {2*hh_mm:.1f} mm  (after margin)")
-    print(f"  Grid      : {args.grid_mm:.1f} mm spacing  →  {n_pts} starting points")
-    print(f"  Speed     : [{args.vmin:.0f}, {args.vmax:.0f}] mm/s  (random per motion)")
-    print(f"  Motions   : {total}  (≈ {total/n_pts:.1f} per point on average)")
-    print(f"  Seed      : {args.seed}")
-    print(f"  Output    : {args.output}/pt####_dir###/")
+    print(f"  COLLECT ROTATION DATA")
+    print(f"  Pitch range : [{args.pitch_min:.0f}°, {args.pitch_max:.0f}°]")
+    print(f"  Offset box  : {OFFSET_BOX_X_MM:.1f} × {OFFSET_BOX_Z_MM:.1f} mm  (1\" × 2\")")
+    print(f"  Speed       : [{args.vmin:.0f}, {args.vmax:.0f}]  (random per path)")
+    print(f"  Paths       : {total}")
+    print(f"  Seed        : {args.seed}")
+    print(f"  Output      : {args.output}/path####/")
     print(f"  Skip existing: {args.skip_existing}")
     print(f"  {'DRY-RUN' if args.dry_run else 'IP: ' + args.ip}")
-    print(f"  Audio     : {'enabled @ ' + str(args.sr) + ' Hz' if args.audio else 'disabled'}")
+    print(f"  Audio       : {'enabled @ ' + str(args.sr) + ' Hz' if args.audio else 'disabled'}")
     print(f"{SEP}\n")
 
     # ── connect once ───────────────────────────────────────────────────────
     arm = None
+    base_tcp_offset = [0, 0, 0, 0, 0, 0]
     if not args.dry_run:
         print(f"  Connecting to XArm at {args.ip} ...", end="", flush=True)
         arm = XArmAPI(args.ip)
         arm.motion_enable(enable=True)
         arm.set_mode(0); arm.set_state(state=0)
         time.sleep(0.5)
+        # Save the arm's current TCP offset so we can restore it later
+        base_tcp_offset = list(arm.tcp_offset)
         print(" ✓")
-        home_tcp = build_tcp(0, 0, args.origin_x_mm, args.y,
-                              args.origin_z_mm, args.roll, args.pitch, args.yaw)
-        print("  Moving to centre origin ...", end="", flush=True)
+        # Move to reference position with neutral pitch (0°)
+        home_tcp = [args.origin_x_mm, args.y, args.origin_z_mm,
+                    args.roll, 0, args.yaw]
+        print("  Moving to reference position ...", end="", flush=True)
         arm.set_position(*home_tcp, speed=args.vmin, mvacc=args.mvacc, wait=True)
         print(" ✓\n")
     else:
@@ -596,33 +498,21 @@ def main():
     # ── main loop ──────────────────────────────────────────────────────────
     done = skipped = failed = 0
     state = RobotState()
-    cur_pt_idx = None   # track current grid point to avoid redundant moves
 
-    for motion_idx, plan in enumerate(plans):
+    for path_idx, plan in enumerate(plans):
         if _stop["flag"]:
             break
 
         run_folder = os.path.join(args.output, plan.folder)
-        tag = f"[{motion_idx+1:>5}/{total}]  {plan.folder}  " \
-              f"θ={plan.theta_deg:6.1f}°  v={plan.speed_mm_s:5.1f} mm/s  " \
-              f"d={plan.distance_mm:5.1f} mm"
+        tag = f"[{path_idx+1:>5}/{total}]  {plan.folder}  " \
+              f"offset=({plan.offset_x_mm:+6.1f}, {plan.offset_z_mm:+6.1f})  " \
+              f"pitch={plan.start_pitch_deg:+6.1f}→{plan.end_pitch_deg:+6.1f}°  " \
+              f"v={plan.speed:5.1f}"
 
         if args.skip_existing and os.path.isdir(run_folder):
             print(f"  {tag}  → SKIP")
             skipped += 1
             continue
-
-        # Move to starting point if we're on a different grid point
-        if cur_pt_idx != plan.pt_idx:
-            tcp_start = build_tcp(plan.px, plan.pz,
-                                   args.origin_x_mm, args.y, args.origin_z_mm,
-                                   args.roll, args.pitch, args.yaw)
-            if arm is not None:
-                arm.set_position(*tcp_start, speed=args.vmin,
-                                  mvacc=args.mvacc, wait=True)
-            elif args.dry_run:
-                time.sleep(0.01)
-            cur_pt_idx = plan.pt_idx
 
         print(f"  {tag}")
 
@@ -636,10 +526,11 @@ def main():
                                        device_hint=args.device_hint)
             audio_rec.start()
 
-        ok = run_radial_motion(
+        ok = run_rotation_motion(
             arm=arm, state=state, plan=plan,
             ox_mm=args.origin_x_mm, oy_mm=args.y, oz_mm=args.origin_z_mm,
-            roll=args.roll, pitch=args.pitch, yaw=args.yaw,
+            roll=args.roll, yaw=args.yaw,
+            base_tcp_offset=base_tcp_offset,
             mvacc=args.mvacc, dwell_s=args.dwell, dry_run=args.dry_run,
             logger=logger,
         )
@@ -660,9 +551,12 @@ def main():
     print(f"  Done: {done}  |  Skipped: {skipped}  |  Failed: {failed}  |  Total: {total}")
 
     if arm:
-        print("  Returning to origin ...", end="", flush=True)
-        home_tcp = build_tcp(0, 0, args.origin_x_mm, args.y,
-                              args.origin_z_mm, args.roll, args.pitch, args.yaw)
+        # Restore original TCP offset and return to reference position
+        arm.set_tcp_offset(base_tcp_offset)
+        time.sleep(0.5)
+        print("  Returning to reference position ...", end="", flush=True)
+        home_tcp = [args.origin_x_mm, args.y, args.origin_z_mm,
+                    args.roll, 0, args.yaw]
         arm.set_position(*home_tcp, speed=args.vmin, mvacc=args.mvacc, wait=True)
         print(" ✓")
         arm.disconnect()
